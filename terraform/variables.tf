@@ -1,7 +1,7 @@
 variable "location" {
   type        = string
-  description = "Azure region for all resources"
-  default     = "eastus"
+  description = "Azure region for all resources. eastus2 is the default because eastus periodically runs out of Container Apps (AKS-backed) capacity."
+  default     = "eastus2"
 }
 
 variable "project" {
