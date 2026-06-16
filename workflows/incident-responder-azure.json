@@ -1,0 +1,261 @@
+{
+  "name": "Azure Incident Responder",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incident",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-160, 300],
+      "webhookId": "incident"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Azure posts the Common Alert Schema. Pull the fields the runbook needs:\n// what fired, which VM, and the metric value vs threshold.\nconst raw = $input.first().json.body;\nconst payload = typeof raw === 'string' ? JSON.parse(raw) : raw;\nconst ess = payload.data.essentials;\nconst targetId = (ess.alertTargetIDs || [])[0] || '';\n\nconst out = {\n  monitorCondition: ess.monitorCondition,\n  alertRule: ess.alertRule,\n  severity: ess.severity,\n  description: ess.description || '',\n  targetId,\n  vmName: targetId.split('/').pop(),\n  threshold: 80\n};\n\ntry {\n  const c0 = payload.data.alertContext.condition.allOf[0];\n  out.metricName = c0.metricName;\n  out.metricValue = c0.metricValue;\n  out.threshold = Number(c0.threshold);\n} catch (e) {}\n\nreturn [{ json: out }];"
+      },
+      "id": "parse-alert",
+      "name": "Parse Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [60, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "is-fired",
+              "leftValue": "={{ $json.monitorCondition }}",
+              "rightValue": "Fired",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-fired",
+      "name": "Is Fired?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [280, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'claude-haiku-4-5-20251001',\n  max_tokens: 350,\n  messages: [{\n    role: 'user',\n    content: 'You are an SRE assistant. Write a concise incident summary (3 sentences max) and one recommended next step for an on-call engineer. Alert: ' + $json.alertRule + '. Severity: ' + $json.severity + '. VM: ' + $json.vmName + '. Metric ' + ($json.metricName || 'Percentage CPU') + ' at ' + ($json.metricValue || 'n/a') + ' vs threshold ' + $json.threshold + '. The automated runbook is about to restart this VM.'\n  }]\n}) }}",
+        "options": {}
+      },
+      "id": "haiku",
+      "name": "Claude Haiku Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 200],
+      "credentials": {
+        "httpHeaderAuth": { "id": "REPLACE_ANTHROPIC", "name": "Anthropic API (x-api-key)" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Carry the alert context forward alongside the model's summary text.\nconst ctx = $('Parse Alert').item.json;\nconst body = $input.first().json;\nconst summary = (body.content && body.content[0] && body.content[0].text) || 'No summary returned.';\nreturn [{ json: { ...ctx, summary } }];"
+      },
+      "id": "format-summary",
+      "name": "Format Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 200]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#incidents", "mode": "name" },
+        "text": "=:rotating_light: *Incident detected* `{{ $json.alertRule }}`\n*VM:* {{ $json.vmName }}\n*Severity:* {{ $json.severity }}\n\n{{ $json.summary }}\n\n_Runbook is restarting the VM and will verify recovery._",
+        "otherOptions": {}
+      },
+      "id": "slack-incident",
+      "name": "Slack: Incident Card",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [960, 200],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_SLACK", "name": "Slack account" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://management.azure.com{{ $json.targetId }}/restart",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "api-version", "value": "2023-09-01" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "restart-vm",
+      "name": "Restart VM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 200],
+      "credentials": {
+        "oAuth2Api": { "id": "REPLACE_AZURE", "name": "Azure Management (client credentials)" }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 90,
+        "unit": "seconds"
+      },
+      "id": "wait",
+      "name": "Wait 90s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1400, 200],
+      "webhookId": "incident-wait"
+    },
+    {
+      "parameters": {
+        "url": "=https://management.azure.com{{ $('Format Summary').item.json.targetId }}/providers/microsoft.insights/metrics",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "api-version", "value": "2023-10-01" },
+            { "name": "metricnames", "value": "Percentage CPU" },
+            { "name": "aggregation", "value": "Average" },
+            { "name": "interval", "value": "PT1M" },
+            { "name": "timespan", "value": "PT10M" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "get-metric",
+      "name": "Get CPU Metric",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 200],
+      "credentials": {
+        "oAuth2Api": { "id": "REPLACE_AZURE", "name": "Azure Management (client credentials)" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read the most recent non-null average CPU. If it is back under the\n// threshold (or there is no fresh data after the restart), the incident\n// is resolved; otherwise escalate.\nconst ctx = $('Format Summary').item.json;\nconst body = $input.first().json;\nlet latest = null;\ntry {\n  const data = body.value[0].timeseries[0].data || [];\n  for (const d of data) { if (d.average != null) latest = d.average; }\n} catch (e) {}\nconst resolved = latest == null || latest < ctx.threshold;\nreturn [{ json: { ...ctx, latestCpu: latest, resolved } }];"
+      },
+      "id": "check-resolved",
+      "name": "Check Resolved",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1840, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "resolved",
+              "leftValue": "={{ $json.resolved }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-resolved",
+      "name": "Resolved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2060, 200]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#incidents", "mode": "name" },
+        "text": "=:white_check_mark: *Resolved* `{{ $json.alertRule }}` cleared after automated restart of {{ $json.vmName }}. Latest CPU: {{ $json.latestCpu }}%.",
+        "otherOptions": {}
+      },
+      "id": "slack-resolved",
+      "name": "Slack: Resolved",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2300, 80],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_SLACK", "name": "Slack account" }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#incidents", "mode": "name" },
+        "text": "=:warning: *Escalation* `{{ $json.alertRule }}` still breaching on {{ $json.vmName }} after automated restart (CPU {{ $json.latestCpu }}%). Page the on-call engineer.",
+        "otherOptions": {}
+      },
+      "id": "slack-escalate",
+      "name": "Slack: Escalate",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2300, 320],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_SLACK", "name": "Slack account" }
+      }
+    }
+  ],
+  "connections": {
+    "Alert Webhook": { "main": [[{ "node": "Parse Alert", "type": "main", "index": 0 }]] },
+    "Parse Alert": { "main": [[{ "node": "Is Fired?", "type": "main", "index": 0 }]] },
+    "Is Fired?": {
+      "main": [
+        [{ "node": "Claude Haiku Summary", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Claude Haiku Summary": { "main": [[{ "node": "Format Summary", "type": "main", "index": 0 }]] },
+    "Format Summary": { "main": [[{ "node": "Slack: Incident Card", "type": "main", "index": 0 }]] },
+    "Slack: Incident Card": { "main": [[{ "node": "Restart VM", "type": "main", "index": 0 }]] },
+    "Restart VM": { "main": [[{ "node": "Wait 90s", "type": "main", "index": 0 }]] },
+    "Wait 90s": { "main": [[{ "node": "Get CPU Metric", "type": "main", "index": 0 }]] },
+    "Get CPU Metric": { "main": [[{ "node": "Check Resolved", "type": "main", "index": 0 }]] },
+    "Check Resolved": { "main": [[{ "node": "Resolved?", "type": "main", "index": 0 }]] },
+    "Resolved?": {
+      "main": [
+        [{ "node": "Slack: Resolved", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Escalate", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
